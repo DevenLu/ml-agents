@@ -3,7 +3,11 @@ from typing import Dict, NamedTuple, List, Any, Optional, Callable, Set
 import cloudpickle
 
 from mlagents_envs.environment import UnityEnvironment
-from mlagents_envs.exception import UnityCommunicationException, UnityTimeOutException
+from mlagents_envs.exception import (
+    UnityCommunicationException,
+    UnityTimeOutException,
+    UnityEnvironmentException,
+)
 from multiprocessing import Process, Pipe, Queue
 from multiprocessing.connection import Connection
 from queue import Empty as EmptyQueueException
@@ -64,6 +68,9 @@ class UnityEnvWorker:
     def recv(self) -> EnvironmentResponse:
         try:
             response: EnvironmentResponse = self.conn.recv()
+            if response.name == "env_close":
+                env_exception: Exception = response.payload
+                raise env_exception
             return response
         except (BrokenPipeError, EOFError):
             raise UnityCommunicationException("UnityEnvironment worker: recv failed.")
@@ -93,9 +100,7 @@ def worker(
     shared_float_properties = FloatPropertiesChannel()
     engine_configuration_channel = EngineConfigurationChannel()
     engine_configuration_channel.set_configuration(engine_configuration)
-    env: BaseEnv = env_factory(
-        worker_id, [shared_float_properties, engine_configuration_channel]
-    )
+    env: BaseEnv = None
 
     def _send_response(cmd_name, payload):
         parent_conn.send(EnvironmentResponse(cmd_name, worker_id, payload))
@@ -115,6 +120,9 @@ def worker(
         return result
 
     try:
+        env = env_factory(
+            worker_id, [shared_float_properties, engine_configuration_channel]
+        )
         while True:
             cmd: EnvironmentCommand = parent_conn.recv()
             if cmd.name == "step":
@@ -145,9 +153,15 @@ def worker(
                 _send_response("reset", all_step_result)
             elif cmd.name == "close":
                 break
-    except (KeyboardInterrupt, UnityCommunicationException, UnityTimeOutException):
+    except (
+        KeyboardInterrupt,
+        UnityCommunicationException,
+        UnityTimeOutException,
+        UnityEnvironmentException,
+    ) as ex:
         logger.info(f"UnityEnvironment worker {worker_id}: environment stopping.")
-        step_queue.put(EnvironmentResponse("env_close", worker_id, None))
+        step_queue.put(EnvironmentResponse("env_close", worker_id, ex))
+        _send_response("env_close", ex)
     finally:
         # If this worker has put an item in the step queue that hasn't been processed by the EnvManager, the process
         # will hang until the item is processed. We avoid this behavior by using Queue.cancel_join_thread()
@@ -156,7 +170,8 @@ def worker(
         logger.debug(f"UnityEnvironment worker {worker_id} closing.")
         step_queue.cancel_join_thread()
         step_queue.close()
-        env.close()
+        if env is not None:
+            env.close()
         logger.debug(f"UnityEnvironment worker {worker_id} done.")
 
 
@@ -223,9 +238,8 @@ class SubprocessEnvManager(EnvManager):
                 while True:
                     step = self.step_queue.get_nowait()
                     if step.name == "env_close":
-                        raise UnityCommunicationException(
-                            "At least one of the environments has closed."
-                        )
+                        env_exception: Exception = step.payload
+                        raise env_exception
                     self.env_workers[step.worker_id].waiting = False
                     if step.worker_id not in step_workers:
                         worker_steps.append(step)
